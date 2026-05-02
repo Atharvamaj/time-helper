@@ -18,16 +18,32 @@ unsigned long countdownDurationMs = 0;
 bool lastState = HIGH;
 unsigned long pressStartMs = 0;
 
+int faceFrame = 0;
+unsigned long lastFaceMs = 0;
+
 void drawFace() {
+  if (millis() - lastFaceMs > 450) {
+    faceFrame = (faceFrame + 1) % 4;
+    lastFaceMs = millis();
+  }
+
   u8g2.clearBuffer();
 
-  u8g2.drawDisc(40, 30, 6);
-  u8g2.drawDisc(88, 30, 6);
+  if (faceFrame == 1) {
+    u8g2.drawBox(34, 30, 14, 3);
+    u8g2.drawBox(80, 30, 14, 3);
+  } else {
+    u8g2.drawDisc(40, 30, 6);
+    u8g2.drawDisc(88, 30, 6);
+  }
 
-  // simple mouth
-  u8g2.drawLine(50, 48, 78, 48);
-  u8g2.drawLine(50, 48, 45, 43);
-  u8g2.drawLine(78, 48, 83, 43);
+  if (faceFrame == 2) {
+    u8g2.drawLine(50, 48, 78, 48);
+  } else {
+    u8g2.drawLine(50, 48, 78, 48);
+    u8g2.drawLine(50, 48, 45, 43);
+    u8g2.drawLine(78, 48, 83, 43);
+  }
 
   u8g2.sendBuffer();
 }
@@ -74,8 +90,7 @@ void drawTimer() {
 
 void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  Wire.begin(20, 21);   // SDA = GPIO20, SCL = GPIO21
+  Wire.begin(20, 21);
   u8g2.begin();
 }
 
