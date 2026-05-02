@@ -1,0 +1,121 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 21, 20);
+
+#define BUTTON_PIN 5
+
+int options[] = {10, 15, 30};
+int selected = 0;
+
+bool inMenu = false;
+bool running = false;
+
+unsigned long countdownStartMs = 0;
+unsigned long countdownDurationMs = 0;
+
+bool lastState = HIGH;
+unsigned long pressStartMs = 0;
+
+void drawFace() {
+  u8g2.clearBuffer();
+
+  u8g2.drawDisc(40, 30, 6);
+  u8g2.drawDisc(88, 30, 6);
+
+  // simple mouth
+  u8g2.drawLine(50, 48, 78, 48);
+  u8g2.drawLine(50, 48, 45, 43);
+  u8g2.drawLine(78, 48, 83, 43);
+
+  u8g2.sendBuffer();
+}
+
+void drawMenu() {
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB08_tr);
+
+  u8g2.drawStr(20, 18, "Focus Timer");
+
+  char buf[20];
+  sprintf(buf, "%d min", options[selected]);
+
+  u8g2.drawStr(45, 38, buf);
+  u8g2.drawStr(4, 60, "click next | hold start");
+
+  u8g2.sendBuffer();
+}
+
+void drawTimer() {
+  unsigned long elapsed = millis() - countdownStartMs;
+  unsigned long remain = 0;
+
+  if (countdownDurationMs > elapsed) {
+    remain = countdownDurationMs - elapsed;
+  }
+
+  int sec = remain / 1000;
+  int m = sec / 60;
+  int s = sec % 60;
+
+  char buf[20];
+  sprintf(buf, "%02d:%02d", m, s);
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_logisoso20_tr);
+  u8g2.drawStr(20, 45, buf);
+  u8g2.sendBuffer();
+
+  if (remain == 0) {
+    running = false;
+  }
+}
+
+void setup() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  Wire.begin(20, 21);   // SDA = GPIO20, SCL = GPIO21
+  u8g2.begin();
+}
+
+void loop() {
+  bool state = digitalRead(BUTTON_PIN);
+
+  if (lastState == HIGH && state == LOW) {
+    pressStartMs = millis();
+  }
+
+  if (lastState == LOW && state == HIGH) {
+    unsigned long pressTime = millis() - pressStartMs;
+
+    if (pressTime < 500) {
+      if (!inMenu && !running) {
+        inMenu = true;
+      } else if (inMenu) {
+        selected = (selected + 1) % 3;
+      }
+    } else {
+      if (inMenu) {
+        countdownDurationMs = options[selected] * 60UL * 1000UL;
+        countdownStartMs = millis();
+        running = true;
+        inMenu = false;
+      } else if (running) {
+        running = false;
+      }
+    }
+  }
+
+  lastState = state;
+
+  if (running) {
+    drawTimer();
+  } else if (inMenu) {
+    drawMenu();
+  } else {
+    drawFace();
+  }
+
+  delay(30);
+}
