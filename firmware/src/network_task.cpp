@@ -1,0 +1,1019 @@
+// ==========================================================================
+//  QBIT -- Network task
+// ==========================================================================
+#include "network_task.h"
+#include "app_state.h"
+#include "settings.h"
+#include "time_manager.h"
+#include "mqtt_ha.h"
+#include "poke_handler.h"
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <NetWizard.h>
+#include <ESPmDNS.h>
+#include <ArduinoJson.h>
+#include <ArduinoWebsockets.h>
+#include <PubSubClient.h>
+#if defined(ESP32)
+#include <esp_system.h>
+#include <esp_timer.h>
+#include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/portmacro.h>
+#endif
+
+// ==========================================================================
+//  Configuration
+// ==========================================================================
+
+#ifndef WS_HOST
+#define WS_HOST         "localhost"
+#endif
+#ifndef WS_PORT
+#define WS_PORT         3001
+#endif
+#define WS_PATH         "/device"
+#ifndef WS_API_KEY
+#define WS_API_KEY      ""
+#endif
+#define WS_RECONNECT_MS 5000
+#define WIFI_RECONNECT_TIMEOUT_MS 15000
+#define PORTAL_RETRY_INTERVAL_MS  30000    // while AP is up, retry saved WiFi in background every 30s
+// NetWizard stopPortal() forces WiFi.mode(STA)+reconnect; WL_CONNECTED can drop briefly. Skip
+// (or defer) the display "WiFi Offline" queue event right after stopPortal; still deliver if
+// the link stays down after this window.
+// Covers NetWizard /exit handler (NETWIZARD_EXIT_TIMEOUT 5s) + STA reconnect after stopPortal().
+#define WIFI_SUPPRESS_DISCONNECT_UI_MS  10000
+
+// Bitmap poke: 1bpp row-major, size = (height_pages) * width, height_pages <= 8
+#define POKE_BMP_MAX_WIDTH  512
+#define POKE_BMP_MAX_PAGES 8
+
+// Validate decoded bitmap size matches claimed width (no integer overflow / OOB).
+static bool isValidBitmapSize(uint16_t width, size_t decodedLen) {
+    if (width == 0 || width > POKE_BMP_MAX_WIDTH) return false;
+    if (decodedLen == 0) return false;
+    if (decodedLen % width != 0) return false;
+    size_t pages = decodedLen / width;
+    return pages <= POKE_BMP_MAX_PAGES;
+}
+
+// ==========================================================================
+//  External objects (created in main.cpp)
+// ==========================================================================
+
+extern AsyncWebServer server;
+extern NetWizard      NW;
+
+// ==========================================================================
+//  Internal state
+// ==========================================================================
+
+using namespace websockets;
+static WebsocketsClient _wsClient;
+static bool             _wsConnected = false;
+// esp_timer_get_time() (us) at last WS ConnectionOpened; 0 if disconnected. Avoids millis() ~49.7d wrap.
+static int64_t          _wsCloudConnectedAtUs = 0;
+static unsigned long    _wsLastReconnect = 0;
+
+// _wsConnected + _wsCloudConnectedAtUs are read from AsyncWeb handlers and written from WS / WiFi
+// paths; take a short critical section so int64 + bool are not observed torn on 32-bit MCUs.
+#if defined(ESP32)
+static portMUX_TYPE _wsCloudMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void wsCloudSet(bool connected, int64_t connectedAtUs) {
+    portENTER_CRITICAL(&_wsCloudMux);
+    _wsConnected          = connected;
+    _wsCloudConnectedAtUs = connectedAtUs;
+    portEXIT_CRITICAL(&_wsCloudMux);
+}
+
+static bool wsIsCloudConnected(void) {
+    portENTER_CRITICAL(&_wsCloudMux);
+    bool c = _wsConnected;
+    portEXIT_CRITICAL(&_wsCloudMux);
+    return c;
+}
+
+static void wsCloudSnapshot(bool *outConn, int64_t *outUs) {
+    portENTER_CRITICAL(&_wsCloudMux);
+    *outConn = _wsConnected;
+    *outUs   = _wsCloudConnectedAtUs;
+    portEXIT_CRITICAL(&_wsCloudMux);
+}
+#else
+static void wsCloudSet(bool connected, int64_t connectedAtUs) {
+    _wsConnected          = connected;
+    _wsCloudConnectedAtUs = connectedAtUs;
+}
+
+static bool wsIsCloudConnected(void) {
+    return _wsConnected;
+}
+
+static void wsCloudSnapshot(bool *outConn, int64_t *outUs) {
+    *outConn = _wsConnected;
+    *outUs   = _wsCloudConnectedAtUs;
+}
+#endif
+
+static WiFiClient   _mqttWifi;
+static PubSubClient _mqttClient;   // setClient() called at runtime to avoid static init order issues (fixes #1)
+static unsigned long _mqttLastReconnect = 0;
+static char _mqttHostStable[MQTT_HOST_MAX_LEN + 1] = {0};
+#define MQTT_RECONNECT_MS 5000
+
+static bool          _wifiConnected = false;
+static unsigned long _wifiLostMs    = 0;
+// True after STA has connected at least once this boot. Used with NW.isConfigured() so we
+// do not treat first-time captive setup (no saved creds, never STA) as "reconnect → stopPortal
+// before SUCCESS", while still allowing cold boot with saved creds but no router to open AP.
+static bool          _hadStaConnection                = false;
+static bool          _portalRestartedForReconnect     = false;
+static unsigned long _portalRetryAfterMs              = 0;  // when to stop portal and retry saved WiFi
+// After provisioning SUCCESS, delay stopPortal so the phone can poll /netwizard/status and
+// POST /netwizard/exit before HTTP/AP goes away (NetWizard uses NETWIZARD_EXIT_TIMEOUT).
+static unsigned long _portalProvisionStopAfterMs      = 0;
+static unsigned long _versionCheckAfterMs             = 0;  // run version check after this time
+static unsigned long _tzCheckAfterMs                  = 0;  // run timezone detection after this time
+static unsigned long _wifiSuppressDisconnectUiUntilMs = 0;
+static bool          _wifiDisconnectUiPending         = false;
+static bool          _nwPrevPortalSuccess            = false;
+// NetWizard closes the Soft AP after idle portal timeout (~5 min default). Re-open while still
+// unconfigured so the OLED is not stuck on "AP in 0s" with no AP (PORTAL_ACTIVE cleared).
+static unsigned long _reopenSetupPortalAfterMs = 0;
+// While portal is up, avoid calling NW.connect() faster than the STA stack can finish an attempt
+// (otherwise ESP logs: "sta is connecting, return error").
+static unsigned long _portalBgConnectEarliestMs = 0;
+
+// ==========================================================================
+//  WebSocket helpers
+// ==========================================================================
+
+static bool wsConnect() {
+    if (_wsClient.available()) {
+        _wsClient.close();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    bool ok;
+    if (WS_PORT == 443) {
+        ok = _wsClient.connectSecure(WS_HOST, WS_PORT, WS_PATH);
+    } else {
+        ok = _wsClient.connect(WS_HOST, WS_PORT, WS_PATH);
+    }
+    if (!ok) {
+        Serial.println("[WS] Connection failed");
+    }
+    return ok;
+}
+
+static void wsSendDeviceInfo() {
+    if (!wsIsCloudConnected()) return;
+    StaticJsonDocument<384> doc;
+    doc["type"]    = "device.register";
+    doc["id"]      = getDeviceId();
+    doc["name"]    = getDeviceName();
+    doc["ip"]      = WiFi.localIP().toString();
+    doc["version"] = kQbitVersion;
+    String msg;
+    serializeJson(doc, msg);
+    _wsClient.send(msg);
+}
+
+void networkSendDeviceInfo() {
+    wsSendDeviceInfo();
+}
+
+void networkSendClaimConfirm() {
+    if (!wsIsCloudConnected()) return;
+    StaticJsonDocument<64> doc;
+    doc["type"] = "claim_confirm";
+    String msg;
+    serializeJson(doc, msg);
+    _wsClient.send(msg);
+    Serial.println("Claim confirmed");
+}
+
+void networkSendClaimReject() {
+    if (!wsIsCloudConnected()) return;
+    StaticJsonDocument<64> doc;
+    doc["type"] = "claim_reject";
+    String msg;
+    serializeJson(doc, msg);
+    _wsClient.send(msg);
+    Serial.println("Claim rejected (timeout)");
+}
+
+void networkSendFriendConfirm() {
+    if (!wsIsCloudConnected()) return;
+    StaticJsonDocument<64> doc;
+    doc["type"] = "friend_confirm";
+    String msg;
+    serializeJson(doc, msg);
+    _wsClient.send(msg);
+    Serial.println("Friend confirmed");
+}
+
+void networkSendFriendReject() {
+    if (!wsIsCloudConnected()) return;
+    StaticJsonDocument<64> doc;
+    doc["type"] = "friend_reject";
+    String msg;
+    serializeJson(doc, msg);
+    _wsClient.send(msg);
+    Serial.println("Friend request rejected (timeout)");
+}
+
+// ==========================================================================
+//  WebSocket event + message handlers
+// ==========================================================================
+
+static void wsEvent(WebsocketsClient &client, WebsocketsEvent event, WSInterfaceString data) {
+    (void)client;
+    (void)data;
+    switch (event) {
+        case WebsocketsEvent::ConnectionOpened:
+            wsCloudSet(true, esp_timer_get_time());
+            xEventGroupSetBits(connectivityBits, WS_CONNECTED_BIT);
+            Serial.println("[WS] Connected to backend");
+            wsSendDeviceInfo();
+            mqttPublishServerConnectionState(true);
+            {
+                NetworkEvent evt = {};
+                evt.kind = NetworkEvent::WS_STATUS;
+                evt.connected = true;
+                xQueueSend(networkEventQueue, &evt, 0);
+            }
+            break;
+        case WebsocketsEvent::ConnectionClosed:
+            wsCloudSet(false, 0);
+            xEventGroupClearBits(connectivityBits, WS_CONNECTED_BIT);
+            Serial.println("[WS] Disconnected");
+            mqttPublishServerConnectionState(false);
+            // stopPortal() after captive provisioning tears down the link briefly; the socket closes
+            // here then reconnects seconds later. Suppress OLED "Server Offline" in the same window
+            // used for WiFi disconnect UI (set when stopPortal runs / portal success is latched).
+            {
+                const unsigned long until = _wifiSuppressDisconnectUiUntilMs;
+                if (until == 0 || millis() >= until) {
+                    NetworkEvent evt = {};
+                    evt.kind = NetworkEvent::WS_STATUS;
+                    evt.connected = false;
+                    xQueueSend(networkEventQueue, &evt, 0);
+                }
+            }
+            break;
+        case WebsocketsEvent::GotPing:
+        case WebsocketsEvent::GotPong:
+            break;
+    }
+}
+
+static void wsMessage(WebsocketsClient &client, WebsocketsMessage message) {
+    (void)client;
+    if (!message.isText()) return;
+
+    String data = message.data();
+    StaticJsonDocument<2048> doc;
+    if (deserializeJson(doc, data)) return;
+
+    const char *msgType = doc["type"];
+    if (!msgType) return;
+
+    if (strcmp(msgType, "poke") == 0) {
+        const char *sender = doc["sender"] | "Someone";
+        const char *text   = doc["text"]   | "Poke!";
+
+        if (doc["senderBitmap"].is<const char*>() && doc["textBitmap"].is<const char*>()) {
+            const char *senderBmp = doc["senderBitmap"];
+            uint16_t senderW      = doc["senderBitmapWidth"] | 0;
+            const char *textBmp   = doc["textBitmap"];
+            uint16_t textW        = doc["textBitmapWidth"] | 0;
+
+            if (senderW > 0 && textW > 0 &&
+                senderW <= POKE_BMP_MAX_WIDTH && textW <= POKE_BMP_MAX_WIDTH) {
+                size_t sLen = 0, tLen = 0;
+                uint8_t *sBmp = decodeBase64Alloc(senderBmp, &sLen);
+                uint8_t *tBmp = decodeBase64Alloc(textBmp, &tLen);
+
+                bool valid = sBmp && tBmp &&
+                             isValidBitmapSize(senderW, sLen) &&
+                             isValidBitmapSize(textW, tLen);
+
+                if (valid) {
+                    NetworkEvent evt = {};
+                    evt.kind = NetworkEvent::POKE_BITMAP;
+                    strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+                    strncpy(evt.text, text, sizeof(evt.text) - 1);
+                    evt.senderBmp = sBmp;
+                    evt.senderBmpWidth = senderW;
+                    evt.senderBmpLen = sLen;
+                    evt.textBmp = tBmp;
+                    evt.textBmpWidth = textW;
+                    evt.textBmpLen = tLen;
+                    if (xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100)) != pdTRUE) {
+                        free(sBmp);
+                        free(tBmp);
+                    }
+                } else {
+                    if (sBmp) free(sBmp);
+                    if (tBmp) free(tBmp);
+                    NetworkEvent evt = {};
+                    evt.kind = NetworkEvent::POKE;
+                    strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+                    strncpy(evt.text, text, sizeof(evt.text) - 1);
+                    xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+                }
+            } else {
+                NetworkEvent evt = {};
+                evt.kind = NetworkEvent::POKE;
+                strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+                strncpy(evt.text, text, sizeof(evt.text) - 1);
+                xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+            }
+        } else {
+            NetworkEvent evt = {};
+            evt.kind = NetworkEvent::POKE;
+            strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+            strncpy(evt.text, text, sizeof(evt.text) - 1);
+            xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+        }
+
+        mqttPublishPokeEvent(sender, text);
+    }
+
+    if (strcmp(msgType, "broadcast") == 0) {
+        const char *sender = doc["sender"] | "QBIT-NETWORK";
+        const char *text   = doc["text"]   | "";
+        const char *title  = doc["title"]  | "NOTIFY";
+
+        if (doc["senderBitmap"].is<const char*>() && doc["textBitmap"].is<const char*>()) {
+            const char *senderBmp = doc["senderBitmap"];
+            uint16_t senderW      = doc["senderBitmapWidth"] | 0;
+            const char *textBmp   = doc["textBitmap"];
+            uint16_t textW        = doc["textBitmapWidth"] | 0;
+
+            if (senderW > 0 && textW > 0 &&
+                senderW <= POKE_BMP_MAX_WIDTH && textW <= POKE_BMP_MAX_WIDTH) {
+                size_t sLen = 0, tLen = 0;
+                uint8_t *sBmp = decodeBase64Alloc(senderBmp, &sLen);
+                uint8_t *tBmp = decodeBase64Alloc(textBmp, &tLen);
+
+                bool valid = sBmp && tBmp &&
+                             isValidBitmapSize(senderW, sLen) &&
+                             isValidBitmapSize(textW, tLen);
+
+                if (valid) {
+                    NetworkEvent evt = {};
+                    evt.kind = NetworkEvent::POKE_BITMAP;
+                    strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+                    evt.sender[sizeof(evt.sender) - 1] = '\0';
+                    strncpy(evt.text, text, sizeof(evt.text) - 1);
+                    evt.text[sizeof(evt.text) - 1] = '\0';
+                    strncpy(evt.title, title, sizeof(evt.title) - 1);
+                    evt.title[sizeof(evt.title) - 1] = '\0';
+                    evt.senderBmp = sBmp;
+                    evt.senderBmpWidth = senderW;
+                    evt.senderBmpLen = sLen;
+                    evt.textBmp = tBmp;
+                    evt.textBmpWidth = textW;
+                    evt.textBmpLen = tLen;
+                    if (xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100)) != pdTRUE) {
+                        free(sBmp);
+                        free(tBmp);
+                    }
+                } else {
+                    if (sBmp) free(sBmp);
+                    if (tBmp) free(tBmp);
+                    NetworkEvent evt = {};
+                    evt.kind = NetworkEvent::POKE;
+                    strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+                    evt.sender[sizeof(evt.sender) - 1] = '\0';
+                    strncpy(evt.text, text, sizeof(evt.text) - 1);
+                    evt.text[sizeof(evt.text) - 1] = '\0';
+                    strncpy(evt.title, title, sizeof(evt.title) - 1);
+                    evt.title[sizeof(evt.title) - 1] = '\0';
+                    xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+                }
+            } else {
+                NetworkEvent evt = {};
+                evt.kind = NetworkEvent::POKE;
+                strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+                evt.sender[sizeof(evt.sender) - 1] = '\0';
+                strncpy(evt.text, text, sizeof(evt.text) - 1);
+                evt.text[sizeof(evt.text) - 1] = '\0';
+                strncpy(evt.title, title, sizeof(evt.title) - 1);
+                evt.title[sizeof(evt.title) - 1] = '\0';
+                xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+            }
+        } else {
+            NetworkEvent evt = {};
+            evt.kind = NetworkEvent::POKE;
+            strncpy(evt.sender, sender, sizeof(evt.sender) - 1);
+            evt.sender[sizeof(evt.sender) - 1] = '\0';
+            strncpy(evt.text, text, sizeof(evt.text) - 1);
+            evt.text[sizeof(evt.text) - 1] = '\0';
+            strncpy(evt.title, title, sizeof(evt.title) - 1);
+            evt.title[sizeof(evt.title) - 1] = '\0';
+            xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+        }
+    }
+
+    if (strcmp(msgType, "claim_request") == 0) {
+        const char *userName = doc["userName"] | "Unknown";
+        NetworkEvent evt = {};
+        evt.kind = NetworkEvent::CLAIM_REQUEST;
+        strncpy(evt.sender, userName, sizeof(evt.sender) - 1);
+        xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+    }
+
+    if (strcmp(msgType, "friend_request") == 0) {
+        const char *userName = doc["userName"] | "Unknown";
+        NetworkEvent evt = {};
+        evt.kind = NetworkEvent::FRIEND_REQUEST;
+        strncpy(evt.sender, userName, sizeof(evt.sender) - 1);
+        xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+    }
+}
+
+// ==========================================================================
+//  Firmware version check (HTTPS GET latest.json), deferred ~15s after WiFi
+// ==========================================================================
+#define VERSION_CHECK_URL "https://seanchangx.github.io/QBIT/latest.json"
+#define VERSION_CHECK_TIMEOUT_MS 45000  // HTTPClient uses ms (compare with millis())
+#define VERSION_RECHECK_INTERVAL_MS (6UL * 60UL * 60UL * 1000UL)  // periodic check while WiFi up
+
+static void checkFirmwareVersion() {
+    Serial.println("[Version] Checking...");
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(20);
+    HTTPClient http;
+    if (!http.begin(client, VERSION_CHECK_URL)) {
+        Serial.println("[Version] HTTP begin failed");
+        return;
+    }
+    http.setTimeout(VERSION_CHECK_TIMEOUT_MS);
+    int code = http.GET();
+    if (code != 200) {
+        Serial.printf("[Version] GET failed: %d\n", code);
+        http.end();
+        return;
+    }
+    String payload = http.getString();
+    http.end();
+
+    StaticJsonDocument<384> doc;
+    if (deserializeJson(doc, payload)) {
+        Serial.println("[Version] JSON parse failed");
+        return;
+    }
+    const char *remoteVer = doc["version"];
+    if (!remoteVer || remoteVer[0] == '\0') {
+        Serial.println("[Version] No version in JSON");
+        return;
+    }
+    const char *remoteNorm = (remoteVer[0] == 'v' || remoteVer[0] == 'V') ? (remoteVer + 1) : remoteVer;
+    const char *localNorm  = (kQbitVersion[0] == 'v' || kQbitVersion[0] == 'V') ? (kQbitVersion + 1) : kQbitVersion;
+    if (strcmp(remoteNorm, localNorm) != 0) {
+        updateAvailable = true;
+        strncpy(updateAvailableVersion, remoteVer, UPDATE_AVAILABLE_VERSION_LEN - 1);
+        updateAvailableVersion[UPDATE_AVAILABLE_VERSION_LEN - 1] = '\0';
+        Serial.printf("[Version] Update available: %s (current: %s)\n", remoteVer, kQbitVersion);
+    } else {
+        updateAvailable        = false;
+        updateAvailableVersion[0] = '\0';
+        Serial.printf("[Version] Up to date: %s\n", kQbitVersion);
+    }
+}
+
+// ==========================================================================
+//  MQTT helpers
+// ==========================================================================
+#define POKE_MQTT_TEXT_MAX 25  // max chars for poke message (no bitmap path)
+static char _haStoredPokeText[POKE_MQTT_TEXT_MAX + 1] = {0};  // typed in HA; used when Poke button is pressed
+
+// Sanitize and truncate to maxLen: printable ASCII only, null-terminated.
+static void sanitizePokeText(char *dst, size_t dstSize, const char *src, size_t maxLen) {
+    if (!dst || dstSize == 0) return;
+    size_t di = 0;
+    const size_t cap = (maxLen + 1 < dstSize) ? maxLen + 1 : dstSize;
+    while (di < cap - 1 && src && *src) {
+        unsigned char c = (unsigned char)*src++;
+        if (c >= 0x20 && c <= 0x7E) dst[di++] = (char)c;
+    }
+    dst[di] = '\0';
+}
+
+static void mqttCallback(char *topic, byte *payload, unsigned int length) {
+    String topicStr = String(topic);
+    String prefix   = getMqttPrefix();
+    String id       = getDeviceId();
+
+    // Build raw string from payload
+    String rawPayload = "";
+    for (unsigned int i = 0; i < length; i++) rawPayload += (char)payload[i];
+
+    // Poke command (JSON payload). If user typed in HA text entity, use that; else use payload text (default "Poke!").
+    if (topicStr == prefix + "/" + id + "/command") {
+        StaticJsonDocument<1024> doc;
+        if (deserializeJson(doc, payload, length)) return;
+        const char *cmd = doc["command"];
+        if (!cmd) return;
+        if (strcmp(cmd, "poke") == 0) {
+            const char *sender = doc["sender"] | "Home Assistant";
+            const char *text   = doc["text"]   | "Poke!";
+            NetworkEvent evt = {};
+            evt.kind = NetworkEvent::POKE;
+            sanitizePokeText(evt.sender, sizeof(evt.sender), sender, POKE_MQTT_TEXT_MAX);
+            if (evt.sender[0] == '\0') strcpy(evt.sender, "Home Assistant");
+            if (_haStoredPokeText[0] != '\0') {
+                strncpy(evt.text, _haStoredPokeText, sizeof(evt.text) - 1);
+                evt.text[sizeof(evt.text) - 1] = '\0';
+            } else {
+                sanitizePokeText(evt.text, sizeof(evt.text), text, POKE_MQTT_TEXT_MAX);
+                if (evt.text[0] == '\0') strcpy(evt.text, "Poke!");
+            }
+            xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+            mqttPublishPokeEvent(evt.sender, evt.text);
+            Serial.printf("[MQTT] Poke from %s: %s\n", evt.sender, evt.text);
+        }
+        return;
+    }
+
+    // HA text entity: store only (no poke). When user presses Poke button we use this or "Poke!".
+    if (topicStr == prefix + "/" + id + "/poke_text/set") {
+        const char *textSrc = rawPayload.c_str();
+        if (length > 0 && payload[0] == '{') {
+            StaticJsonDocument<256> doc;
+            if (!deserializeJson(doc, payload, length)) {
+                const char *v = doc["value"].as<const char*>();
+                if (!v || !v[0]) v = doc["text"].as<const char*>();
+                if (!v || !v[0]) v = doc["message"].as<const char*>();
+                if (!v || !v[0]) v = doc["state"].as<const char*>();
+                if (v && v[0]) textSrc = v;
+            }
+        }
+        sanitizePokeText(_haStoredPokeText, sizeof(_haStoredPokeText), textSrc, POKE_MQTT_TEXT_MAX);
+        return;
+    }
+
+    // Mute set (plain text: ON/OFF)
+    if (topicStr == prefix + "/" + id + "/mute/set") {
+        NetworkEvent evt = {};
+        evt.kind = NetworkEvent::MQTT_COMMAND;
+        strncpy(evt.sender, "mute", sizeof(evt.sender) - 1);
+        strncpy(evt.text, rawPayload.c_str(), sizeof(evt.text) - 1);
+        xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+        return;
+    }
+
+    // Animation next (no payload needed)
+    if (topicStr == prefix + "/" + id + "/animation/next") {
+        NetworkEvent evt = {};
+        evt.kind = NetworkEvent::MQTT_COMMAND;
+        strncpy(evt.sender, "animation_next", sizeof(evt.sender) - 1);
+        xQueueSend(networkEventQueue, &evt, pdMS_TO_TICKS(100));
+        return;
+    }
+}
+
+static void mqttReconnect() {
+    // Only attempt MQTT connect when WiFi is actually connected.
+    // This avoids PubSubClient errors like rc = -2 when there is no network.
+    String mqttHost = getMqttHost();
+    mqttHost.trim();
+    if (!getMqttEnabled() || mqttHost.length() == 0) return;
+    if (!_wifiConnected || WiFi.status() != WL_CONNECTED) return;
+    if (_mqttClient.connected()) return;
+
+    unsigned long now = millis();
+    if (now - _mqttLastReconnect < MQTT_RECONNECT_MS) return;
+    _mqttLastReconnect = now;
+
+    const uint16_t mqttPort = getMqttPort();
+    String mqttUser = getMqttUser();
+    String mqttPass = getMqttPass();
+    String prefix   = getMqttPrefix();
+    String id       = getDeviceId();
+
+    // Keep host in static storage; PubSubClient::setServer(const char*) stores
+    // the pointer and may outlive temporary Strings. Length already capped by settings.
+    if (mqttHost.length() >= sizeof(_mqttHostStable))
+        Serial.printf("[MQTT] Host truncated to %u chars\n", (unsigned)(sizeof(_mqttHostStable) - 1));
+    strncpy(_mqttHostStable, mqttHost.c_str(), sizeof(_mqttHostStable) - 1);
+    _mqttHostStable[sizeof(_mqttHostStable) - 1] = '\0';
+
+    _mqttClient.setClient(_mqttWifi);
+    IPAddress brokerIp;
+    if (brokerIp.fromString(_mqttHostStable)) {
+        _mqttClient.setServer(brokerIp, mqttPort);
+    } else {
+        _mqttClient.setServer(_mqttHostStable, mqttPort);
+    }
+    _mqttClient.setBufferSize(1024);
+    _mqttClient.setCallback(mqttCallback);
+    Serial.printf("[MQTT] Connecting to %s:%u\n", _mqttHostStable, mqttPort);
+
+    String clientId = "qbit-" + id;
+    String statusTopic = prefix + "/" + id + "/status";
+    bool ok;
+    if (mqttUser.length() > 0) {
+        ok = _mqttClient.connect(clientId.c_str(),
+                                 mqttUser.c_str(), mqttPass.c_str(),
+                                 statusTopic.c_str(), 0, true, "offline");
+    } else {
+        ok = _mqttClient.connect(clientId.c_str(),
+                                 statusTopic.c_str(), 0, true, "offline");
+    }
+
+    if (ok) {
+        Serial.printf("[MQTT] Connected to %s:%u\n", _mqttHostStable, mqttPort);
+        xEventGroupSetBits(connectivityBits, MQTT_CONNECTED_BIT);
+
+        // Publish online + info
+        _mqttClient.publish(statusTopic.c_str(), "online", true);
+
+        String infoTopic = prefix + "/" + id + "/info";
+        StaticJsonDocument<256> info;
+        info["id"]   = id;
+        info["name"] = getDeviceName();
+        info["ip"]   = WiFi.localIP().toString();
+        String infoStr;
+        serializeJson(info, infoStr);
+        _mqttClient.publish(infoTopic.c_str(), infoStr.c_str(), true);
+
+        // Subscribe to command topics
+        _mqttClient.subscribe((prefix + "/" + id + "/command").c_str());
+        _mqttClient.subscribe((prefix + "/" + id + "/poke_text/set").c_str());
+        _mqttClient.subscribe((prefix + "/" + id + "/mute/set").c_str());
+        _mqttClient.subscribe((prefix + "/" + id + "/animation/next").c_str());
+
+        // Publish HA discovery
+        mqttPublishHADiscovery(&_mqttClient);
+        mqttPublishServerConnectionState(wsIsCloudConnected());
+    } else {
+        Serial.printf("[MQTT] Connection failed (rc=%d)\n", _mqttClient.state());
+    }
+}
+
+// ==========================================================================
+//  Network task main loop
+// ==========================================================================
+
+void networkTask(void *param) {
+    (void)param;
+
+    // Wait a bit for WiFi to initialize
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    // Set up WebSocket handlers
+    if (String(WS_API_KEY).length() > 0) {
+        _wsClient.addHeader("Authorization", "Bearer " + String(WS_API_KEY));
+    }
+    _wsClient.onEvent(wsEvent);
+    _wsClient.onMessage(wsMessage);
+
+    // Initial NTP sync
+    timeManagerInit();
+
+    for (;;) {
+        // --- NetWizard loop ---
+        NW.loop();
+
+        // --- WiFi monitoring ---
+        if (WiFi.status() != WL_CONNECTED) {
+            _portalProvisionStopAfterMs = 0;
+            // Display uses PORTAL_ACTIVE_BIT to switch from "waiting" to QR. That must track
+            // whether the setup Soft AP is actually up — not the "15s reconnect → startPortal"
+            // path (first-time provisioning never hits that path once _hadStaConnection gating exists).
+#if defined(ESP32)
+            {
+                wifi_mode_t wm = WiFi.getMode();
+                if (wm == WIFI_AP || wm == WIFI_AP_STA) {
+                    xEventGroupSetBits(connectivityBits, PORTAL_ACTIVE_BIT);
+                    _reopenSetupPortalAfterMs = 0;
+                } else {
+                    xEventGroupClearBits(connectivityBits, PORTAL_ACTIVE_BIT);
+                    if (!NW.isConfigured() && !_portalRestartedForReconnect) {
+                        unsigned long m = millis();
+                        if (_reopenSetupPortalAfterMs == 0) {
+                            _reopenSetupPortalAfterMs = m + 5000;
+                        } else if ((long)(m - _reopenSetupPortalAfterMs) >= 0) {
+                            _reopenSetupPortalAfterMs = m + 15000;
+                            NW.startPortal();
+                            wifiApplyApRfStabilityForPcbAntenna();
+                            Serial.println("[WiFi] Setup portal was down; restarting captive AP");
+                        }
+                    } else {
+                        _reopenSetupPortalAfterMs = 0;
+                    }
+                }
+            }
+#else
+            if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+                xEventGroupSetBits(connectivityBits, PORTAL_ACTIVE_BIT);
+                _reopenSetupPortalAfterMs = 0;
+            } else {
+                xEventGroupClearBits(connectivityBits, PORTAL_ACTIVE_BIT);
+                if (!NW.isConfigured() && !_portalRestartedForReconnect) {
+                    unsigned long m = millis();
+                    if (_reopenSetupPortalAfterMs == 0) {
+                        _reopenSetupPortalAfterMs = m + 5000;
+                    } else if ((long)(m - _reopenSetupPortalAfterMs) >= 0) {
+                        _reopenSetupPortalAfterMs = m + 15000;
+                        NW.startPortal();
+                        wifiApplyApRfStabilityForPcbAntenna();
+                        Serial.println("[WiFi] Setup portal was down; restarting captive AP");
+                    }
+                } else {
+                    _reopenSetupPortalAfterMs = 0;
+                }
+            }
+#endif
+            if (_wifiLostMs == 0) {
+                _wifiLostMs = millis();
+                if (_wifiLostMs == 0) _wifiLostMs = 1;
+                // Boot / first captive setup: STA has never been up — not a "disconnect", so do
+                // not enqueue WIFI_STATUS false (would be wrong for GIF_PLAYBACK) or log "lost".
+                const bool wasStaUp = _wifiConnected;
+                _wifiConnected = false;
+                wsCloudSet(false, 0);
+                xEventGroupClearBits(connectivityBits, WIFI_CONNECTED_BIT | WS_CONNECTED_BIT);
+                if (wasStaUp) {
+                    Serial.println("[WiFi] Connection lost");
+                    const bool suppressUi = (_wifiSuppressDisconnectUiUntilMs != 0 &&
+                                             millis() < _wifiSuppressDisconnectUiUntilMs);
+                    if (!suppressUi) {
+                        NetworkEvent evt = {};
+                        evt.kind = NetworkEvent::WIFI_STATUS;
+                        evt.connected = false;
+                        xQueueSend(networkEventQueue, &evt, 0);
+                    } else {
+                        _wifiDisconnectUiPending = true;
+                    }
+                }
+            } else if (_wifiDisconnectUiPending &&
+                       (_wifiSuppressDisconnectUiUntilMs == 0 ||
+                        millis() >= _wifiSuppressDisconnectUiUntilMs)) {
+                _wifiDisconnectUiPending = false;
+                _wifiSuppressDisconnectUiUntilMs = 0;
+                NetworkEvent evt = {};
+                evt.kind = NetworkEvent::WIFI_STATUS;
+                evt.connected = false;
+                xQueueSend(networkEventQueue, &evt, 0);
+            }
+            // Open AP + background retries when STA is unavailable, but not during first-time
+            // captive setup (no saved creds yet): there "not connected" is normal until the
+            // user submits SSID; isConfigured()==false avoids the old bug where stopPortal ran
+            // on first STA connect because this flag was set after 15s.
+            if ((NW.isConfigured() || _hadStaConnection) &&
+                !_portalRestartedForReconnect &&
+                (millis() - _wifiLostMs > WIFI_RECONNECT_TIMEOUT_MS)) {
+                _portalRestartedForReconnect = true;
+                _portalRetryAfterMs = millis() + PORTAL_RETRY_INTERVAL_MS;
+                NW.startPortal();
+                wifiApplyApRfStabilityForPcbAntenna();
+                xEventGroupSetBits(connectivityBits, PORTAL_ACTIVE_BIT);
+                Serial.println("[WiFi] Auto-reconnect timeout, restarting AP portal");
+            }
+            // While AP is up, periodically retry saved WiFi in background (AP stays up; e.g. router came back)
+            if (_portalRestartedForReconnect && _portalRetryAfterMs > 0 && millis() >= _portalRetryAfterMs) {
+                _portalRetryAfterMs = millis() + PORTAL_RETRY_INTERVAL_MS;
+                const unsigned long m = millis();
+                if (m >= _portalBgConnectEarliestMs) {
+                    _portalBgConnectEarliestMs = m + 20000;   // min gap between connect attempts (ms)
+                    NW.connect();   // use NetWizard's saved credentials (WiFi.reconnect() uses different storage)
+                    Serial.println("[WiFi] Portal retry: reconnecting to saved WiFi in background");
+                } else {
+                    // STA may still be mid-connect from last attempt; try again soon without spamming esp_wifi.
+                    _portalRetryAfterMs = _portalBgConnectEarliestMs;
+                }
+            }
+        } else {
+            _reopenSetupPortalAfterMs = 0;
+            _portalBgConnectEarliestMs = 0;
+            // STA up: latch first-connect + clear loss timer (must not gate portal/stopPortal below).
+            if (_wifiLostMs > 0 || !_wifiConnected) {
+                if (!_wifiConnected) {
+                    _wifiConnected = true;
+                    _hadStaConnection = true;
+                    wifiRestoreStaTxPower();
+                    xEventGroupSetBits(connectivityBits, WIFI_CONNECTED_BIT);
+                    _wifiDisconnectUiPending         = false;
+                    _wifiSuppressDisconnectUiUntilMs = 0;
+
+                    NetworkEvent evt = {};
+                    evt.kind = NetworkEvent::WIFI_STATUS;
+                    evt.connected = true;
+                    xQueueSend(networkEventQueue, &evt, 0);
+
+                    // Defer IP-based timezone/weather bootstrap (same HTTP as time_manager)
+                    if (getTimezoneIANA().length() == 0 || !getWeatherManual())
+                        _tzCheckAfterMs = millis() + 5000;
+                    _versionCheckAfterMs = millis() + 15000;
+                }
+                _wifiLostMs = 0;
+            }
+            // Run every tick while STA connected: deferred NW.stopPortal() after provisioning SUCCESS
+            // must not sit inside (_wifiLostMs > 0 || !_wifiConnected) — that is false after first connect.
+            const bool portalSuccess = (NW.getPortalState() == NetWizardPortalState::SUCCESS);
+            if (portalSuccess && !_nwPrevPortalSuccess) {
+                unsigned long u = millis() + WIFI_SUPPRESS_DISCONNECT_UI_MS;
+                if (u > _wifiSuppressDisconnectUiUntilMs) {
+                    _wifiSuppressDisconnectUiUntilMs = u;
+                }
+            }
+            _nwPrevPortalSuccess = portalSuccess;
+            // Reconnect path: tear down AP immediately. Provisioning SUCCESS: wait before
+            // stopPortal() so the captive UI can finish (see NetWizard NETWIZARD_EXIT_TIMEOUT).
+            bool stopPortalNow = false;
+            if (_portalRestartedForReconnect) {
+                stopPortalNow = true;
+            } else if (portalSuccess) {
+                if (_portalProvisionStopAfterMs == 0) {
+                    _portalProvisionStopAfterMs = millis() + 6000;
+                } else if (millis() >= _portalProvisionStopAfterMs) {
+                    stopPortalNow = true;
+                }
+            } else {
+                _portalProvisionStopAfterMs = 0;
+            }
+
+            if (stopPortalNow) {
+                _portalRestartedForReconnect = false;
+                _portalRetryAfterMs = 0;
+                _portalProvisionStopAfterMs = 0;
+                xEventGroupClearBits(connectivityBits, PORTAL_ACTIVE_BIT);
+                // Avoid OLED "WiFi Offline" when stopPortal() drops STA briefly then reconnects.
+                _wifiSuppressDisconnectUiUntilMs = millis() + WIFI_SUPPRESS_DISCONNECT_UI_MS;
+                NW.stopPortal();
+                wifiRestoreStaTxPower();
+                if (portalSuccess) {
+                    Serial.println("[WiFi] Provisioning success, stopping AP portal");
+                } else {
+                    Serial.println("[WiFi] Reconnected, stopping AP portal");
+                }
+            }
+        }
+
+        // --- WebSocket ---
+        if (wsIsCloudConnected()) {
+            _wsClient.poll();
+        } else if (_wifiConnected) {
+            unsigned long now = millis();
+            if (now - _wsLastReconnect >= WS_RECONNECT_MS) {
+                _wsLastReconnect = now;
+                wsConnect();
+            }
+        }
+
+        // --- MQTT ---
+        // Only manage MQTT when WiFi is connected; otherwise skip to avoid connection errors.
+        if (getMqttEnabled() && _wifiConnected && WiFi.status() == WL_CONNECTED) {
+            if (!_mqttClient.connected()) {
+                xEventGroupClearBits(connectivityBits, MQTT_CONNECTED_BIT);
+                mqttReconnect();
+            }
+            _mqttClient.loop();
+        }
+
+        // --- Deferred timezone detection (~5s after WiFi connect) ---
+        if (_tzCheckAfterMs > 0 && millis() >= _tzCheckAfterMs) {
+            _tzCheckAfterMs = 0;
+            if (getTimezoneIANA().length() == 0 || !getWeatherManual())
+                timeManagerDetectTimezone();
+        }
+        // --- Deferred version check (~15s after WiFi connect, then every 6h while STA up) ---
+        if (_versionCheckAfterMs > 0 && millis() >= _versionCheckAfterMs) {
+            checkFirmwareVersion();
+            if (_wifiConnected && WiFi.status() == WL_CONNECTED)
+                _versionCheckAfterMs = millis() + VERSION_RECHECK_INTERVAL_MS;
+            else
+                _versionCheckAfterMs = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+unsigned long networkGetWifiLostMs() {
+    return _wifiLostMs;
+}
+
+unsigned long networkGetBootUptimeSeconds() {
+#if defined(ESP32)
+    int64_t us = esp_timer_get_time();
+    if (us < 0) us = 0;
+    return (unsigned long)(us / 1000000LL);
+#else
+    return millis() / 1000UL;
+#endif
+}
+
+bool networkIsCloudWsConnected() {
+    return wsIsCloudConnected();
+}
+
+unsigned long networkGetCloudWsUptimeSeconds() {
+    bool     conn;
+    int64_t  atUs;
+    wsCloudSnapshot(&conn, &atUs);
+    if (!conn || atUs == 0) return 0;
+#if defined(ESP32)
+    int64_t delta = esp_timer_get_time() - atUs;
+    if (delta < 0) return 0;
+    return (unsigned long)(delta / 1000000LL);
+#else
+    return 0;
+#endif
+}
+
+void networkWifiReset() {
+    NW.reset();
+#if defined(ESP32)
+    vTaskDelay(pdMS_TO_TICKS(800));
+    esp_restart();
+#elif defined(ESP8266)
+    delay(800);
+    ESP.restart();
+#endif
+}
+
+// ==========================================================================
+//  MQTT publish helpers (accessible from other modules)
+// ==========================================================================
+
+void mqttPublishPokeEvent(const char *sender, const char *text) {
+    if (!getMqttEnabled() || !_mqttClient.connected()) return;
+    String topic = getMqttPrefix() + "/" + getDeviceId() + "/poke";
+    StaticJsonDocument<384> doc;
+    doc["sender"] = sender;
+    doc["text"]   = text;
+    doc["time"]   = timeManagerGetISO8601();
+    String payload;
+    serializeJson(doc, payload);
+    _mqttClient.publish(topic.c_str(), payload.c_str(), true);
+}
+
+void mqttPublishMuteState(bool muted) {
+    if (!getMqttEnabled() || !_mqttClient.connected()) return;
+    String topic = getMqttPrefix() + "/" + getDeviceId() + "/mute/state";
+    _mqttClient.publish(topic.c_str(), muted ? "ON" : "OFF", true);
+}
+
+void mqttPublishTouchEvent(GestureType type) {
+    if (!getMqttEnabled() || !_mqttClient.connected()) return;
+    String topic = getMqttPrefix() + "/" + getDeviceId() + "/touch";
+    const char *typeStr = "none";
+    switch (type) {
+        case TOUCH_DOWN:  typeStr = "touch_down";  break;
+        case TOUCH_UP:    typeStr = "touch_up";    break;
+        case SINGLE_TAP:  typeStr = "single_tap";  break;
+        case DOUBLE_TAP:  typeStr = "double_tap";  break;
+        case LONG_PRESS:  typeStr = "long_press";  break;
+        default: break;
+    }
+    StaticJsonDocument<128> doc;
+    doc["type"] = typeStr;
+    doc["time"] = timeManagerGetISO8601();
+    String payload;
+    serializeJson(doc, payload);
+    _mqttClient.publish(topic.c_str(), payload.c_str(), false);
+}
+
+void mqttPublishAnimationState(const String &filename) {
+    if (!getMqttEnabled() || !_mqttClient.connected()) return;
+    String topic = getMqttPrefix() + "/" + getDeviceId() + "/animation/state";
+    _mqttClient.publish(topic.c_str(), filename.c_str(), true);
+}
+
+void mqttPublishServerConnectionState(bool connected) {
+    if (!getMqttEnabled() || !_mqttClient.connected()) return;
+    String topic = getMqttPrefix() + "/" + getDeviceId() + "/server/status";
+    _mqttClient.publish(topic.c_str(), connected ? "online" : "offline", true);
+}
+
+// Apply AP RF settings for ESP32-C3 PCB antenna boards (fixes #2): lower TX power and HT20.
+// Call after NetWizard has started the portal (AP or AP_STA). Does not change WiFi mode.
+void wifiApplyApRfStabilityForPcbAntenna() {
+#if defined(ESP32)
+    wifi_mode_t m = WiFi.getMode();
+    if (m == WIFI_AP || m == WIFI_AP_STA) {
+        WiFi.setTxPower(WIFI_POWER_13dBm);
+        esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+    }
+#endif
+}
+
+// Restore default TX power for STA. setTxPower() is global; 13dBm from AP fix would otherwise persist and weaken STA/MQTT/dashboard.
+void wifiRestoreStaTxPower() {
+#if defined(ESP32)
+    if (WiFi.getMode() == WIFI_STA)
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+#endif
+}
